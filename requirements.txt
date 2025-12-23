@@ -7,3 +7,9 @@ pytesseract
 pillow
 google-generativeai
 firebase-admin
+genai
+google
+dotenv
+google-genai
+razorpay
+python-dateutil

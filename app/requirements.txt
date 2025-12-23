@@ -12,3 +12,4 @@ dotenv
 google-genai
 razorpay
 python-dateutil
+pydantic_settings

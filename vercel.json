@@ -1,3 +1,8 @@
 {
-  "rootDirectory": "app"
+  "builds": [
+    {
+      "src": "app/main.py",
+      "use": "@vercel/python"
+    }
+  ]
 }

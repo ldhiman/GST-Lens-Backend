@@ -1,5 +1,4 @@
 {
-  "version": 2,
   "builds": [
     {
       "src": "app/server.py",
@@ -9,8 +8,7 @@
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "api/server.py"
+      "dest": "app/server.py"
     }
-  ],
-  "outputDirectory": ".vercel/output"
+  ]
 }

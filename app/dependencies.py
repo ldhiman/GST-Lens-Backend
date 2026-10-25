@@ -2,6 +2,7 @@ from fastapi import Header, HTTPException, Depends
 from firebase_admin import auth as firebase_auth
 from app.firebase import db
 from firebase_admin import firestore
+from datetime import datetime, timezone
 
 
 async def verify_firebase_token(authorization: str = Header(None)):
@@ -56,18 +57,37 @@ def credit_required(cost: int = 1):
 def subscription_required():
     async def _guard(user=Depends(verify_firebase_token)):
         uid = user["uid"]
-        snap = db.collection("users").document(uid).get()
+        user_ref = db.collection("users").document(uid)
+        snap = user_ref.get()
 
         if not snap.exists:
             raise HTTPException(status_code=404, detail="User not found")
 
-        sub = snap.to_dict().get("subscription")
+        user_data = snap.to_dict()
+        sub = user_data.get("subscription")
 
         if not sub or not sub.get("active"):
             raise HTTPException(
                 status_code=403,
                 detail="Cloud sync requires active subscription"
             )
+
+        # Check if subscription billing period has expired (> 24h grace window)
+        period_end = sub.get("current_period_end")
+        if period_end:
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            if now_ts > (int(period_end) + 86400):
+                # Auto-expire stale subscription in database
+                user_ref.update({
+                    "subscription.active": False,
+                    "subscription.status": "expired",
+                    "settings.cloud_sync_enabled": False,
+                    "updatedAt": firestore.SERVER_TIMESTAMP
+                })
+                raise HTTPException(
+                    status_code=403,
+                    detail="Subscription period has expired. Please renew your plan."
+                )
 
         return user
 

@@ -7,7 +7,7 @@ from app.dependencies import verify_firebase_token
 from app.firebase import db
 from firebase_admin import firestore
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from dateutil.relativedelta import relativedelta
 
 router = APIRouter(prefix="/payments", tags=["payments"])
@@ -171,6 +171,7 @@ async def razorpay_webhook(request: Request):
             db.collection("users").document(uid).update({
                 "subscription": {
                     "active": True,
+                    "status": "active",
                     "razorpay_subscription_id": sub.get("id"),
                     "plan": "monthly",
                     "current_period_end": sub.get("current_end"),
@@ -179,16 +180,30 @@ async def razorpay_webhook(request: Request):
                 "updatedAt": firestore.SERVER_TIMESTAMP
             })
 
-    # ✅ MONTHLY CREDIT GRANT
+    # ✅ MONTHLY CREDIT GRANT & CYCLE EXTENSION
     elif event_type == "subscription.charged":
         sub = payload.get("subscription", {}).get("entity", {})
         uid = sub.get("notes", {}).get("uid")
 
         if uid:
             add_credits(uid, 100)
+            current_end = sub.get("current_end")
+            updates = {
+                "subscription.active": True,
+                "subscription.status": "active",
+                "updatedAt": firestore.SERVER_TIMESTAMP
+            }
+            if current_end:
+                updates["subscription.current_period_end"] = current_end
+            db.collection("users").document(uid).update(updates)
 
-    # ❌ SUBSCRIPTION STOPPED
-    elif event_type in ["subscription.cancelled", "subscription.halted", "subscription.paused"]:
+    # ❌ SUBSCRIPTION STOPPED / CANCELLED / HALTED (Mandate revoked or charges exhausted)
+    elif event_type in [
+        "subscription.cancelled",
+        "subscription.halted",
+        "subscription.paused",
+        "subscription.pending"
+    ]:
         sub_entity = payload.get("subscription", {}).get("entity", {})
         razorpay_sub_id = sub_entity.get("id")
         notes = sub_entity.get("notes", {})
@@ -211,12 +226,14 @@ async def razorpay_webhook(request: Request):
 
         # Only disable if this is the SAME subscription
         if stored_sub_id == razorpay_sub_id:
+            is_active = False if event_type in ["subscription.cancelled", "subscription.halted"] else user_data.get("subscription", {}).get("active", False)
             user_ref.update({
-                "subscription.active": False,
-                "settings.cloud_sync_enabled": False,
+                "subscription.active": is_active,
+                "subscription.status": event_type.replace("subscription.", ""),
+                "settings.cloud_sync_enabled": is_active,
                 "updatedAt": firestore.SERVER_TIMESTAMP
             })
-            print(f"Disabled cloud sync for user {uid} - subscription {razorpay_sub_id} cancelled")
+            print(f"Updated subscription status for user {uid} ({razorpay_sub_id}): {event_type}")
         else:
             print(f"Ignored cancel event for old subscription {razorpay_sub_id} (current: {stored_sub_id})")
 
@@ -224,6 +241,10 @@ async def razorpay_webhook(request: Request):
 
 
 def get_event_key(event: dict) -> str | None:
+    # 1. Razorpay provides a unique delivery event ID in webhook root
+    if event.get("id"):
+        return event["id"]
+
     etype = event.get("event")
     payload = event.get("payload", {})
 
@@ -231,21 +252,30 @@ def get_event_key(event: dict) -> str | None:
         if etype == "payment.captured":
             return payload["payment"]["entity"]["id"]
 
+        # Prevent cross-event ID collisions by scoping key to the event type
         if etype in {
             "subscription.activated",
             "subscription.cancelled",
             "subscription.halted",
+            "subscription.paused",
+            "subscription.pending",
         }:
-            return payload["subscription"]["entity"]["id"]
+            sub_id = payload["subscription"]["entity"]["id"]
+            return f"{etype}_{sub_id}"
 
         if etype == "subscription.charged":
             # Razorpay sends invoice entity here
-            return payload["invoice"]["entity"]["id"]
+            inv_id = payload.get("invoice", {}).get("entity", {}).get("id")
+            if inv_id:
+                return f"charged_{inv_id}"
+            sub_id = payload.get("subscription", {}).get("entity", {}).get("id")
+            return f"charged_{sub_id}_{event.get('created_at', '')}"
 
-    except KeyError:
+    except (KeyError, TypeError):
         return None
 
     return None
+
 
 
 @router.post("/cancel-subscription")
@@ -293,3 +323,51 @@ async def cancel_subscription(user = Depends(verify_firebase_token)):
     except Exception as e:
         print(f"Razorpay cancel error: {e}")
         raise HTTPException(status_code=500, detail="Failed to cancel subscription")
+
+
+# 4. Reconcile / Sync Subscription directly from Razorpay
+@router.post("/sync-subscription")
+async def sync_subscription(user = Depends(verify_firebase_token)):
+    uid = user["uid"]
+    user_ref = db.collection("users").document(uid)
+    user_snap = user_ref.get()
+
+    if not user_snap.exists:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user_data = user_snap.to_dict()
+    sub = user_data.get("subscription", {})
+    razorpay_sub_id = sub.get("razorpay_subscription_id")
+
+    if not razorpay_sub_id:
+        return {"status": "no_subscription", "active": False}
+
+    try:
+        live_sub = razorpay_client.subscription.fetch(razorpay_sub_id)
+        live_status = live_sub.get("status")  # active, halted, cancelled, completed, expired, pending
+        is_active = live_status == "active"
+        current_end = live_sub.get("current_end")
+
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        # If current_end expired and status is not active, enforce inactive
+        if current_end and now_ts > current_end and live_status != "active":
+            is_active = False
+
+        user_ref.update({
+            "subscription.active": is_active,
+            "subscription.status": live_status,
+            "subscription.current_period_end": current_end,
+            "settings.cloud_sync_enabled": is_active,
+            "updatedAt": firestore.SERVER_TIMESTAMP
+        })
+
+        return {
+            "status": "synced",
+            "active": is_active,
+            "razorpay_status": live_status,
+            "current_period_end": current_end
+        }
+    except Exception as e:
+        print(f"Razorpay sync error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch subscription from Razorpay")
+

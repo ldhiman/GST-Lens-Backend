@@ -1,34 +1,30 @@
-
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, Field, field_validator
 from typing import Optional, Literal
 from app.core.config import settings
-
 import json
 
 client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
-# Define the JSON structure for the AI
-from pydantic import BaseModel
-from typing import Optional, Literal
-
-class FieldWithConfidence(BaseModel):
-    value: Optional[str | float]
-    confidence: float
 
 class InvoiceData(BaseModel):
-    invoice_number: Optional[FieldWithConfidence]
-    invoice_date: Optional[FieldWithConfidence]
-    seller_gstin: Optional[FieldWithConfidence]
-    buyer_gstin: Optional[FieldWithConfidence]
-    invoice_type: Literal["B2B", "B2C"]
-    pos: Optional[str]
-    taxable_value: Optional[float]
-    cgst: Optional[float]
-    sgst: Optional[float]
-    igst: Optional[float]
-    invoice_total: Optional[float]
+    invoice_number: Optional[str] = None
+    invoice_date: Optional[str] = None
+    seller_gstin: Optional[str] = None
+    buyer_gstin: Optional[str] = None
+    invoice_type: Optional[Literal["B2B", "B2C"]] = Field(default_factory=lambda: "B2C")
+    pos: Optional[str] = None
+    taxable_value: Optional[float] = None
+    cgst: Optional[float] = None
+    sgst: Optional[float] = None
+    igst: Optional[float] = None
+    invoice_total: Optional[float] = None
+
+    @field_validator("invoice_type", mode="before")
+    @classmethod
+    def set_invoice_type_default(cls, v):
+        return v if v in ("B2B", "B2C") else "B2C"
 
 
 SYSTEM_PROMPT = """
@@ -40,7 +36,7 @@ STRICT RULES:
 - If unsure, return null
 - GSTIN must be exactly 15 characters
 - All monetary values must be numbers (no symbols)
-- Dates must be DD.MM.YYYY format
+- Dates must be DD-MM-YYYY format
 - If multiple invoices exist, return an array
 
 LOGIC:
@@ -51,6 +47,7 @@ OUTPUT:
 - No explanation, no extra text
 """
 
+
 def extract_invoice_data(file_bytes: bytes, mime_type: str):
     """Sends bytes directly to Gemini without saving to disk."""
     image_part = types.Part.from_bytes(
@@ -60,7 +57,7 @@ def extract_invoice_data(file_bytes: bytes, mime_type: str):
 
     response = client.models.generate_content(
         model="gemini-2.5-flash",
-        contents=[ 
+        contents=[
             SYSTEM_PROMPT,
             image_part,
         ],

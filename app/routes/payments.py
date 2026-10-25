@@ -19,19 +19,21 @@ CREDIT_PACKS = {
     350: 500,   # 350 credits = ₹500
 }
 
-# Subscription plan ID from Razorpay dashboard (₹499/month for cloud sync + 100 credits)
-MONTHLY_PLAN_ID = "plan_Rv5J2PDzXG0hV2"  # Create this in Razorpay dashboard: ₹49900 paise, monthly
+MONTHLY_PLAN_ID = settings.RAZORPAY_MONTHLY_PLAN_ID
+
 
 class CreateOrderRequest(BaseModel):
     credits: int  # must be 50, 150, or 350
 
+
 class CreateSubscriptionRequest(BaseModel):
     plan: str = "monthly"
+
 
 # Transactional credit addition
 def add_credits(uid: str, amount: int):
     user_ref = db.collection("users").document(uid)
-    
+
     @firestore.transactional
     def update_credits(transaction):
         snap = user_ref.get(transaction=transaction)
@@ -42,9 +44,10 @@ def add_credits(uid: str, amount: int):
             "credits": current + amount,
             "updatedAt": firestore.SERVER_TIMESTAMP
         })
-    
+
     transaction = db.transaction()
     update_credits(transaction)
+
 
 # 1. Create one-time order for credit packs
 @router.post("/create-order")
@@ -59,11 +62,10 @@ async def create_order(
 
     price_rupees = CREDIT_PACKS[req.credits]
     amount_paise = price_rupees * 100
-    short_uid = uid[-8:]  # last 8 chars of UID (still unique enough)
+    short_uid = uid[-8:]  # last 8 chars of UID
     short_uuid = uuid.uuid4().hex[:6]
 
-    receipt = f"cr_{short_uid}_{short_uuid}"  # e.g., cr_abcd1234_1a2b3c
-# Length: 2 + 1 + 8 + 1 + 6 = 18 < 40 → safe
+    receipt = f"cr_{short_uid}_{short_uuid}"
     order = razorpay_client.order.create({
         "amount": amount_paise,
         "currency": "INR",
@@ -82,6 +84,7 @@ async def create_order(
         "key_id": settings.RAZORPAY_KEY_ID,
         "receipt": receipt
     }
+
 
 # 2. Create subscription for cloud sync + monthly credits
 @router.post("/create-subscription")
@@ -110,7 +113,10 @@ async def create_subscription(
         "short_url": subscription["short_url"]
     }
 
-def is_event_processed(event_id: str) -> bool:
+
+def is_event_processed(event_id: str | None) -> bool:
+    if not event_id:
+        return False
     ref = db.collection("payment_events").document(event_id)
     if ref.get().exists:
         return True
@@ -139,17 +145,16 @@ async def razorpay_webhook(request: Request):
     print(event)
 
     event_id = get_event_key(event)
-    event_type = event["event"]
-    payload = event["payload"]
-
+    event_type = event.get("event")
+    payload = event.get("payload", {})
 
     # 🔐 Idempotency
-    if is_event_processed(event_id):
+    if event_id and is_event_processed(event_id):
         return {"status": "duplicate_ignored"}
 
     # ✅ CREDIT PURCHASE (one-time)
     if event_type == "payment.captured":
-        payment = payload["payment"]["entity"]
+        payment = payload.get("payment", {}).get("entity", {})
         notes = payment.get("notes", {})
         uid = notes.get("uid")
         credits = int(notes.get("credits", 0))
@@ -159,16 +164,16 @@ async def razorpay_webhook(request: Request):
 
     # ✅ SUBSCRIPTION ACTIVATED
     elif event_type == "subscription.activated":
-        sub = payload["subscription"]["entity"]
+        sub = payload.get("subscription", {}).get("entity", {})
         uid = sub.get("notes", {}).get("uid")
 
         if uid:
             db.collection("users").document(uid).update({
                 "subscription": {
                     "active": True,
-                    "razorpay_subscription_id": sub["id"],
+                    "razorpay_subscription_id": sub.get("id"),
                     "plan": "monthly",
-                    "current_period_end": sub["current_end"],
+                    "current_period_end": sub.get("current_end"),
                 },
                 "settings.cloud_sync_enabled": True,
                 "updatedAt": firestore.SERVER_TIMESTAMP
@@ -176,7 +181,7 @@ async def razorpay_webhook(request: Request):
 
     # ✅ MONTHLY CREDIT GRANT
     elif event_type == "subscription.charged":
-        sub = payload["subscription"]["entity"]
+        sub = payload.get("subscription", {}).get("entity", {})
         uid = sub.get("notes", {}).get("uid")
 
         if uid:
@@ -196,7 +201,7 @@ async def razorpay_webhook(request: Request):
         # Fetch current user data
         user_ref = db.collection("users").document(uid)
         user_snap = user_ref.get()
-        
+
         if not user_snap.exists:
             print(f"User {uid} not found for subscription cancel")
             return {"status": "user_not_found"}
@@ -208,7 +213,7 @@ async def razorpay_webhook(request: Request):
         if stored_sub_id == razorpay_sub_id:
             user_ref.update({
                 "subscription.active": False,
-                "cloud_sync_enabled": False,
+                "settings.cloud_sync_enabled": False,
                 "updatedAt": firestore.SERVER_TIMESTAMP
             })
             print(f"Disabled cloud sync for user {uid} - subscription {razorpay_sub_id} cancelled")
@@ -216,6 +221,7 @@ async def razorpay_webhook(request: Request):
             print(f"Ignored cancel event for old subscription {razorpay_sub_id} (current: {stored_sub_id})")
 
         return {"status": "processed"}
+
 
 def get_event_key(event: dict) -> str | None:
     etype = event.get("event")
@@ -240,6 +246,7 @@ def get_event_key(event: dict) -> str | None:
         return None
 
     return None
+
 
 @router.post("/cancel-subscription")
 async def cancel_subscription(user = Depends(verify_firebase_token)):
@@ -267,9 +274,10 @@ async def cancel_subscription(user = Depends(verify_firebase_token)):
     try:
         # Call Razorpay API to cancel
         razorpay_client.subscription.cancel(
-            razorpay_sub_id,{
-            "cancel_at_cycle_end":True  # Keep access until end of current period
-        })
+            razorpay_sub_id, {
+                "cancel_at_cycle_end": True  # Keep access until end of current period
+            }
+        )
 
         # Update user document
         user_ref.update({
@@ -285,4 +293,3 @@ async def cancel_subscription(user = Depends(verify_firebase_token)):
     except Exception as e:
         print(f"Razorpay cancel error: {e}")
         raise HTTPException(status_code=500, detail="Failed to cancel subscription")
-

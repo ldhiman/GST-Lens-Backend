@@ -4,8 +4,10 @@ from app.dependencies import verify_firebase_token, subscription_required
 from app.firebase import db
 from firebase_admin import firestore
 from datetime import datetime, timezone
+import uuid
 
 router = APIRouter(prefix="/sync")
+
 
 @router.get("/invoices")
 async def get_new_invoices(
@@ -13,7 +15,6 @@ async def get_new_invoices(
     user = Depends(subscription_required())
 ):
     uid = user["uid"]
-    
 
     invoices_ref = db.collection("users").document(uid).collection("invoices")
 
@@ -32,31 +33,43 @@ async def get_new_invoices(
     for doc in docs:
         data = doc.to_dict()
         data["cloud_id"] = doc.id
-        
+
         # Convert timestamps to milliseconds for frontend
         for field in ["created_at", "updated_at"]:
             if field in data and hasattr(data[field], "timestamp"):
                 data[field] = int(data[field].timestamp() * 1000)
-        
+
         invoices.append(data)
 
     return {"invoices": invoices}
 
+
 @router.post("/invoices")
 async def upload_invoices(invoices: list[dict], user=Depends(subscription_required())):
     uid = user["uid"]
-    
-    batch = db.batch()
+
+    # Firestore batch limit is 500 operations. Chunk into 400.
+    CHUNK_SIZE = 400
     cloud_ids = []
 
-    for inv in invoices:
-        # print(inv)
-        ref = db.collection("users").document(uid).collection("invoices").document(inv["data"]["_local_id"])
-        batch.set(ref, {
-            **inv,
-            "updated_at": firestore.SERVER_TIMESTAMP
-        })
-        cloud_ids.append(ref.id)
+    for i in range(0, len(invoices), CHUNK_SIZE):
+        chunk = invoices[i:i + CHUNK_SIZE]
+        batch = db.batch()
 
-    batch.commit()
+        for inv in chunk:
+            local_id = (
+                inv.get("local_id")
+                or inv.get("data", {}).get("_local_id")
+                or inv.get("id")
+                or str(uuid.uuid4())
+            )
+            ref = db.collection("users").document(uid).collection("invoices").document(local_id)
+            batch.set(ref, {
+                **inv,
+                "updated_at": firestore.SERVER_TIMESTAMP
+            })
+            cloud_ids.append(ref.id)
+
+        batch.commit()
+
     return {"cloud_ids": cloud_ids}
